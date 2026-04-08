@@ -1,6 +1,6 @@
 # 模型训练稳定性技术指南
 
-![Status](https://img.shields.io/badge/status-in_progress-yellow)
+![Status](https://img.shields.io/badge/status-complete-success)
 ![Chapters](https://img.shields.io/badge/chapters-9-blue)
 ![Code Examples](https://img.shields.io/badge/code%20examples-12-orange)
 
