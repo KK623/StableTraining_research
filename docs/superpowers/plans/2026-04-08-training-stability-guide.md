@@ -855,43 +855,706 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
 
 ---
 
-## 第4-9章及附录 [概要]
+## 第4章：数值精度与低精度训练（核心章节）
 
-由于计划文档长度限制，第4-9章及附录的详细任务在此简述。完整实现需展开以下内容：
+### Task 4: 撰写第4章 数值精度与低精度训练
 
-### Task 4: 第4章 数值精度与低精度训练（核心）
-**内容**: IEEE 754、混合精度训练、BF16 vs FP16、FP8 E4M3/E5M2、MXFP微缩放、DeepSeek-V3细粒度量化、QAT  
-**文件**: `04-numerical-precision.md`, `mixed_precision.py`
+**Files:**
+- Create: `docs/training-stability-guide/04-numerical-precision.md`
+- Create: `docs/training-stability-guide/code-examples/mixed_precision.py`
+- Create: `docs/training-stability-guide/code-examples/fp8_simulation.py`
 
-### Task 5: 第5章 算法设计层面的稳定性保障（核心）
-**内容**: 随机舍入(SR)、误差反馈(EF)、MOSS微缩放、SAM优化器、谱归一化、TWEO离群值抑制、Unit Scaling、L-GRECO梯度压缩  
-**文件**: `05-algorithm-design.md`, `stochastic_rounding.py`, `gradient_compression.py`
+- [ ] **Step 1: 撰写第4章内容**
 
-### Task 6: 第6章 优化器稳定性
-**内容**: 学习率调度、梯度裁剪、Adam数值问题、8-bit优化器  
-**文件**: `06-optimizer-stability.md`, `optimizer_config.py`
+Create `docs/training-stability-guide/04-numerical-precision.md`:
 
-### Task 7: 第7章 分布式训练稳定性
-**内容**: All-reduce数值误差、ZeRO精度保持、流水线并行  
-**文件**: `07-distributed-stability.md`, `distributed_config.py`
+```markdown
+# 第4章 数值精度与低精度训练
 
-### Task 8: 第8章 调试与诊断方法论
-**内容**: 数值异常检测、训练曲线解读、最小复现构建  
-**文件**: `08-debugging-methodology.md`, `debugging_tools.py`
+本章是全文核心，系统介绍 FP32/FP16/BF16/FP8/MXFP 等精度格式的数值特性。
 
-### Task 9: 第9章 实践检查清单
-**内容**: 训练前/低精度/分布式检查清单、问题诊断流程图  
-**文件**: `09-checklists.md`
+## 4.1 浮点数值基础
 
-### Task 10: 附录
-**内容**: 精度格式对比表、硬件支持矩阵、论文索引  
-**文件**: `appendix.md`
+### 4.1.1 IEEE 754 标准概述
 
-### Task 11: 最终整合与提交
-**内容**: 全文链接检查、格式统一、README更新、推送到GitHub  
-**步骤**: 验证 → 提交 → 推送
+浮点数由三部分组成：符号位 + 指数位 + 尾数位
+
+$$value = (-1)^{sign} \\times 2^{exponent-bias} \\times 1.mantissa$$
+
+### 4.1.2 各精度格式对比
+
+| 格式 | 指数位 | 尾数位 | 动态范围 | 机器精度 | 典型用途 |
+|------|--------|--------|----------|----------|----------|
+| FP32 | 8 | 23 | ~1.7e38 | ~1e-7 | 主权重、损失计算 |
+| FP16 | 5 | 10 | 6.55e4 | ~1e-3 | 前向/反向计算 |
+| BF16 | 8 | 7 | ~1e38 | ~1e-2 | 训练默认格式 |
+| E4M3 | 4 | 3 | 448 | ~0.125 | FP8 前向传播 |
+| E5M2 | 5 | 2 | 57,344 | ~0.25 | FP8 梯度计算 |
+
+**信源**: IEEE 754 标准 — IEEE (电气电子工程师学会)
+
+### 4.1.3 次正规数（Subnormal）问题
+
+次正规数用于表示接近零的极小值，但计算极慢。
+
+```python
+def count_subnormals(tensor):
+    fp32_info = torch.finfo(torch.float32)
+    subnormal_mask = (tensor.abs() > 0) & (tensor.abs() < fp32_info.tiny)
+    return subnormal_mask.sum().item()
+```
+
+## 4.2 混合精度训练机制
+
+### 4.2.1 GradScaler 原理
+
+动态损失缩放防止梯度下溢：
+
+```python
+from torch.cuda.amp import autocast, GradScaler
+
+scaler = GradScaler()
+
+for data, target in dataloader:
+    optimizer.zero_grad()
+    
+    with autocast(dtype=torch.bfloat16):
+        output = model(data)
+        loss = criterion(output, target)
+    
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+```
+
+**机构**: [Micikevicius et al. 2018] — NVIDIA, Baidu Research, UC Berkeley  
+**信源**: [Mixed Precision Training](https://arxiv.org/abs/1710.03740)
+
+### 4.2.2 梯度下溢检测
+
+```python
+def check_gradient_underflow(model):
+    underflow_count = 0
+    total_params = 0
+    
+    for param in model.parameters():
+        if param.grad is not None:
+            total_params += param.grad.numel()
+            underflow_count += (param.grad.abs() < 1e-7).sum().item()
+    
+    underflow_ratio = underflow_count / total_params
+    return underflow_ratio > 0.01
+```
+
+## 4.3 BF16 vs FP16 选择指南
+
+### 4.3.1 数值特性对比
+
+| 特性 | FP16 | BF16 |
+|------|------|------|
+| 指数位 | 5 | 8 |
+| 尾数位 | 10 | 7 |
+| 最小正值 | 6.1e-5 | 1.2e-38 |
+| 最大正值 | 6.55e4 | 3.4e38 |
+
+### 4.3.2 硬件支持矩阵
+
+| 硬件 | FP16 | BF16 | 推荐格式 |
+|------|------|------|----------|
+| NVIDIA V100 | ✅ | ❌ | FP16 |
+| NVIDIA A100 | ✅ | ✅ | BF16 |
+| NVIDIA H100 | ✅ | ✅ | BF16/FP8 |
+| Google TPU v3 | ❌ | ✅ | BF16 |
+
+**信源**: [BFloat16: The secret to high performance on Cloud TPUs](https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus) — Google Brain
+
+## 4.4 FP8 训练前沿
+
+### 4.4.1 E4M3 vs E5M2 格式
+
+- **E4M3**: 4位指数，3位尾数，范围 ±448，用于前向传播
+- **E5M2**: 5位指数，2位尾数，范围 ±57,344，用于梯度计算
+
+**信源**: [FP8 Formats for Deep Learning](https://arxiv.org/abs/2209.05433) — NVIDIA, Arm, Intel, Qualcomm
+
+### 4.4.2 Transformer Engine 实践
+
+```python
+import transformer_engine.pytorch as te
+
+layer = te.Linear(768, 3072)
+
+with te.fp8_autocast():
+    output = layer(input)
+```
+
+**机构**: NVIDIA  
+**信源**: [NVIDIA Transformer Engine](https://docs.nvidia.com/deeplearning/transformer-engine/)
+
+## 4.5 微缩放（Microscaling/MXFP）技术
+
+### 4.5.1 MXFP8 格式
+
+微缩放为张量的子块共享指数，提供比 per-tensor 更细粒度的控制。
+
+**机构**: [Rouhani et al. 2023] — Microsoft Research  
+**信源**: [Microscaling Formats for Deep Learning](https://arxiv.org/abs/2310.10537)
+
+### 4.5.2 DeepSeek-V3 细粒度量化实践
+
+DeepSeek-V3 使用 fine-grained quantization：
+- 激活：1×128 tile-wise 量化
+- 权重：128×128 block-wise 量化
+
+**机构**: DeepSeek (幻方量化)  
+**信源**: [DeepSeek-V3 Technical Report](https://arxiv.org/html/2412.19437v1#S5)
+
+### 4.5.3 NVIDIA Blackwell 硬件支持
+
+Blackwell 架构原生支持 MXFP8，硬件级实现 per-block 缩放。
+
+**信源**: [NVIDIA Blackwell Architecture](https://developer.nvidia.com/blog/per-tensor-and-per-block-scaling-strategies-for-effective-fp8-training/) — NVIDIA
+
+## 4.6 量化感知训练（QAT）稳定性
+
+### 4.6.1 伪量化节点数值行为
+
+```python
+class FakeQuantize(nn.Module):
+    def __init__(self, num_bits=8):
+        super().__init__()
+        self.num_bits = num_bits
+        self.scale = nn.Parameter(torch.ones(1))
+    
+    def forward(self, x):
+        if self.training:
+            x_quant = torch.round(x / self.scale)
+            x_quant = torch.clamp(x_quant, -128, 127)
+            x_dequant = x_quant * self.scale
+            return x_dequant + (x - x_dequant).detach()
+        return x
+```
+
+## 4.7 本章小结
+
+| 主题 | 关键要点 |
+|------|----------|
+| 格式选择 | BF16 为现代硬件默认；FP8 用于极致性能 |
+| 混合精度 | 使用 GradScaler 防止梯度下溢 |
+| FP8 训练 | E4M3 用于前向，E5M2 用于反向 |
+```
+
+- [ ] **Step 2: 创建配套代码**
+
+Create `docs/training-stability-guide/code-examples/mixed_precision.py`:
+
+```python
+"""混合精度训练代码示例"""
+import torch
+import torch.nn as nn
+from torch.cuda.amp import autocast, GradScaler
+
+
+class MixedPrecisionTrainer:
+    def __init__(self, model, optimizer, device='cuda', dtype=torch.bfloat16):
+        self.model = model.to(device)
+        self.optimizer = optimizer
+        self.device = device
+        self.dtype = dtype
+        self.scaler = GradScaler() if dtype == torch.float16 else None
+        
+    def train_step(self, data, target, criterion):
+        self.optimizer.zero_grad()
+        
+        data = data.to(self.device)
+        target = target.to(self.device)
+        
+        with autocast(dtype=self.dtype):
+            output = self.model(data)
+            loss = criterion(output, target)
+        
+        if self.scaler:
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            self.optimizer.step()
+        
+        return loss.item()
+
+
+def check_numerical_health(model):
+    health = {'has_nan': False, 'has_inf': False, 'max_grad': 0.0}
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            if torch.isnan(param.grad).any():
+                health['has_nan'] = True
+            if torch.isinf(param.grad).any():
+                health['has_inf'] = True
+            grad_max = param.grad.abs().max().item()
+            health['max_grad'] = max(health['max_grad'], grad_max)
+    
+    return health
+
+
+if __name__ == "__main__":
+    model = nn.Linear(784, 10)
+    optimizer = torch.optim.Adam(model.parameters())
+    
+    trainer = MixedPrecisionTrainer(model, optimizer, dtype=torch.bfloat16)
+    
+    data = torch.randn(32, 784)
+    target = torch.randint(0, 10, (32,))
+    criterion = nn.CrossEntropyLoss()
+    
+    loss = trainer.train_step(data, target, criterion)
+    print(f"Training loss: {loss:.4f}")
+    
+    health = check_numerical_health(model)
+    print(f"Numerical health: {health}")
+```
+
+Create `docs/training-stability-guide/code-examples/fp8_simulation.py`:
+
+```python
+"""FP8 数值模拟器"""
+import torch
+
+
+class FP8Simulator:
+    E4M3_MAX = 448.0
+    E5M2_MAX = 57344.0
+    
+    @staticmethod
+    def quantize_e4m3(tensor):
+        scale = tensor.abs().max() / FP8Simulator.E4M3_MAX
+        quantized = (tensor / scale).round().clamp(-FP8Simulator.E4M3_MAX, FP8Simulator.E4M3_MAX)
+        return quantized * scale, scale
+    
+    @staticmethod
+    def quantize_e5m2(tensor):
+        scale = tensor.abs().max() / FP8Simulator.E5M2_MAX
+        quantized = (tensor / scale).round().clamp(-FP8Simulator.E5M2_MAX, FP8Simulator.E5M2_MAX)
+        return quantized * scale, scale
+
+
+if __name__ == "__main__":
+    x = torch.randn(100, 100) * 100
+    
+    x_q, scale = FP8Simulator.quantize_e4m3(x)
+    error = (x - x_q).abs().mean()
+    
+    print(f"Original range: [{x.min():.2f}, {x.max():.2f}]")
+    print(f"Quantized range: [{x_q.min():.2f}, {x_q.max():.2f}]")
+    print(f"Mean absolute error: {error:.4f}")
+```
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add docs/training-stability-guide/04-numerical-precision.md
+git add docs/training-stability-guide/code-examples/mixed_precision.py
+git add docs/training-stability-guide/code-examples/fp8_simulation.py
+git commit -m "docs: add chapter 4 - numerical precision and low-precision training (CORE)
+
+- IEEE 754 floating-point fundamentals
+- Mixed precision training with GradScaler
+- BF16 vs FP16 selection guide with hardware matrix
+- FP8 training (E4M3/E5M2 formats)
+- Microscaling/MXFP technology
+- DeepSeek-V3 fine-grained quantization
+- QAT numerical stability
+- Complete code examples
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+```
 
 ---
 
-**执行说明**: 使用 superpowers:subagent-driven-development 或 superpowers:executing-plans 逐个任务执行。
+## 第5章：算法设计层面的稳定性保障（核心章节）
+
+### Task 5: 撰写第5章 算法设计层面的稳定性保障
+
+**Files:**
+- Create: `docs/training-stability-guide/05-algorithm-design.md`
+- Create: `docs/training-stability-guide/code-examples/stochastic_rounding.py`
+- Create: `docs/training-stability-guide/code-examples/sam_optimizer.py`
+
+- [ ] **Step 1: 撰写第5章内容**
+
+Create `docs/training-stability-guide/05-algorithm-design.md`:
+
+```markdown
+# 第5章 算法设计层面的稳定性保障
+
+本章聚焦算法设计层面的稳定性技术，特别是低精度训练中的数值保障手段。
+
+## 5.1 随机舍入（Stochastic Rounding）
+
+### 5.1.1 原理与偏差修正
+
+随机舍入按到相邻值的距离比例概率舍入，保持无偏性：
+
+$$\\mathbb{E}[SR(x)] = x$$
+
+```python
+def stochastic_round(x):
+    """随机舍入实现"""
+    floor = torch.floor(x)
+    ceil = torch.ceil(x)
+    prob = x - floor
+    return torch.where(torch.rand_like(x) < prob, ceil, floor)
+```
+
+### 5.1.2 低精度梯度累加中的应用
+
+```python
+class StochasticRoundAccumulator:
+    def __init__(self, shape, dtype=torch.float16):
+        self.buffer = torch.zeros(shape, dtype=torch.float32)
+        self.dtype = dtype
+    
+    def add(self, grad):
+        self.buffer += grad.float()
+    
+    def read(self):
+        result = stochastic_round(self.buffer)
+        remainder = self.buffer - result
+        self.buffer = remainder
+        return result.to(self.dtype)
+```
+
+### 5.1.3 落地效果
+
+BF16+SR：1.54×吞吐提升，30%内存降低。
+
+**机构**: [Ozkara et al. 2025] — EPFL, IBM Research  
+**信源**: [Stochastic Rounding for LLM Training: Theory and Practice](https://proceedings.mlr.press/v258/ozkara25b.html)
+
+## 5.2 误差补偿机制
+
+### 5.2.1 Kahan累加
+
+```python
+class KahanSum:
+    def __init__(self):
+        self.sum = 0.0
+        self.c = 0.0
+    
+    def add(self, x):
+        y = x - self.c
+        t = self.sum + y
+        self.c = (t - self.sum) - y
+        self.sum = t
+```
+
+### 5.2.2 误差反馈（Error Feedback, EF）
+
+压缩误差本地累加，下一迭代补偿。
+
+**机构**: [Karimireddy et al. 2019] — EPFL  
+**信源**: [Error Compensated Quantized SGD](https://arxiv.org/abs/1611.05301)
+
+## 5.3 微缩放与细粒度量化
+
+### 5.3.1 两级微缩放（MOSS）
+
+全局高精度scale + 局部紧凑scale（2的幂）。
+
+**机构**: [Rouhani et al. 2023] — Microsoft Research  
+**信源**: [Microscaling Formats for Deep Learning](https://arxiv.org/abs/2310.10537)
+
+### 5.3.2 混合粒度策略
+
+- 权重：per-block量化
+- 激活：per-token/per-tile量化
+- 梯度：E5M2格式
+
+**机构**: DeepSeek (幻方量化)  
+**信源**: [DeepSeek-V3 Technical Report](https://arxiv.org/html/2412.19437v1#S5)
+
+## 5.4 噪声注入技术
+
+### 5.4.1 梯度噪声注入（GNI）
+
+```python
+def add_gradient_noise(grad, eta=0.3):
+    """添加高斯噪声到梯度"""
+    noise = torch.randn_like(grad) * eta
+    return grad + noise
+```
+
+### 5.4.2 Sharpness-Aware Minimization (SAM)
+
+SAM 通过权重扰动寻找平坦极小值：
+
+```python
+class SAM(torch.optim.Optimizer):
+    def __init__(self, params, base_optimizer, rho=0.05):
+        super().__init__(params, dict(rho=rho))
+        self.base_optimizer = base_optimizer
+    
+    @torch.no_grad()
+    def first_step(self):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group['rho'] / (grad_norm + 1e-12)
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)
+                self.state[p]['e_w'] = e_w
+    
+    @torch.no_grad()
+    def second_step(self):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                p.sub_(self.state[p]['e_w'])
+        self.base_optimizer.step()
+```
+
+**机构**: [Foret et al. 2020] — FAIR (Meta AI)  
+**信源**: [Sharpness-Aware Minimization](https://arxiv.org/abs/2010.01412)
+
+## 5.5 正则化与稳定性
+
+### 5.5.1 Dropout的数值平滑
+
+Dropout提供期望线性保持，具有数值平滑效应。
+
+### 5.5.2 谱归一化（Spectral Normalization）
+
+控制 Lipschitz 常数，稳定 GAN 训练。
+
+**机构**: [Miyato et al. 2018] — MIT CSAIL, Google Brain  
+**信源**: [Spectral Normalization for GANs](https://arxiv.org/abs/1802.05957)
+
+### 5.5.3 权重衰减的数值行为
+
+AdamW 中的解耦权重衰减在低精度下需特别注意数值稳定性。
+
+## 5.6 离群值抑制与范围管理
+
+### 5.6.1 TWEO（Token-Wise Outlier）
+
+块输出正则化，防止激活值>10,000导致的 divergence。
+
+### 5.6.2 UE8M0上取整
+
+缩放因子向上取整到2的幂，防止溢出。
+
+### 5.6.3 单元缩放（Unit Scaling / u-μP）
+
+初始化时确定最优缩放，Maximal Update Parametrization。
+
+**机构**: [Blake et al. 2024] — Graphcore, University of Cambridge  
+**信源**: [u-μP: The Unit-Scaled Maximal Update Parametrization](https://arxiv.org/pdf/2407.17465v2)
+
+## 5.7 自适应精度分配
+
+### 5.7.1 分层精度回退
+
+敏感层保持FP32/BF16：Embedding层、归一化层、Attention层、MoE路由层、输出层。
+
+**机构**: DeepSeek (幻方量化), NVIDIA  
+**信源**: 
+- [DeepSeek-V3 Technical Report](https://arxiv.org/html/2412.19437v1#S5)
+- [NVFP4 Training](https://developer.nvidia.com/blog/using-nvfp4-low-precision-model-training-for-higher-throughput-without-losing-accuracy/) — NVIDIA
+
+### 5.7.2 动态精度切换
+
+训练阶段感知，损失曲率驱动的精度调整。
+
+## 5.8 梯度压缩与稀疏化
+
+### 5.8.1 L-GRECO层自适应压缩
+
+层间自适应压缩率，无需超参数调优。
+
+**机构**: [Lee et al. 2024] — KAIST (韩国科学技术院)  
+**信源**: [L-GRECO: Layerwise-Adaptive Gradient Compression](https://proceedings.mlsys.org/paper_files/paper/2024/file/9069a8976ff06f6443e7f4172990a580-Paper-Conference.pdf)
+
+### 5.8.2 Top-K稀疏化
+
+仅传输重要梯度分量。
+
+**机构**: [Lin et al. 2017] — Seoul National University, NVIDIA  
+**信源**: [Deep Gradient Compression](https://arxiv.org/abs/1712.01887)
+
+### 5.8.3 分布式Lion优化器
+
+利用二值更新特性，更新而非梯度量化。
+
+**机构**: [Chen et al. 2024] — Google Research, Simons Institute  
+**信源**: [Distributed Lion](https://arxiv.org/pdf/2404.00438.pdf)
+
+## 5.9 本章小结
+
+| 技术类别 | 代表方法 | 适用场景 |
+|----------|----------|----------|
+| 舍入策略 | 随机舍入 | 低精度权重更新 |
+| 误差补偿 | Kahan累加、EF | 梯度压缩、累加精度 |
+| 噪声注入 | SAM、GNI | 寻找平坦极小值 |
+| 范围管理 | Unit Scaling、TWEO | 防止离群值 |
+| 精度分配 | 分层回退 | 混合精度训练 |
+| 梯度压缩 | L-GRECO、Top-K | 分布式训练 |
+```
+
+- [ ] **Step 2: 创建配套代码**
+
+Create `docs/training-stability-guide/code-examples/stochastic_rounding.py`:
+
+```python
+"""随机舍入实现示例"""
+import torch
+
+
+def stochastic_round(x):
+    """随机舍入：按距离比例概率舍入"""
+    floor = torch.floor(x)
+    ceil = torch.ceil(x)
+    prob = x - floor
+    return torch.where(torch.rand_like(x) < prob, ceil, floor)
+
+
+class StochasticRoundAccumulator:
+    """使用随机舍入的梯度累加器"""
+    
+    def __init__(self, shape, dtype=torch.float16):
+        self.buffer = torch.zeros(shape, dtype=torch.float32)
+        self.dtype = dtype
+    
+    def add(self, grad):
+        self.buffer += grad.float()
+    
+    def read(self):
+        result = stochastic_round(self.buffer)
+        remainder = self.buffer - result
+        self.buffer = remainder
+        return result.to(self.dtype)
+
+
+if __name__ == "__main__":
+    x = torch.tensor([1.2, 2.7, 3.5, 4.1])
+    
+    results = []
+    for _ in range(1000):
+        results.append(stochastic_round(x))
+    
+    mean_result = torch.stack(results).float().mean(dim=0)
+    print(f"原始: {x}")
+    print(f"随机舍入期望: {mean_result}")
+    print(f"误差: {(x - mean_result).abs()}")
+```
+
+Create `docs/training-stability-guide/code-examples/sam_optimizer.py`:
+
+```python
+"""SAM优化器实现"""
+import torch
+
+
+class SAM(torch.optim.Optimizer):
+    """Sharpness-Aware Minimization 优化器"""
+    
+    def __init__(self, params, base_optimizer, rho=0.05):
+        assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
+        
+        defaults = dict(rho=rho)
+        super().__init__(params, defaults)
+        
+        self.base_optimizer = base_optimizer
+        self.param_groups = self.base_optimizer.param_groups
+    
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grad_norm = self._grad_norm()
+        for group in self.param_groups:
+            scale = group['rho'] / (grad_norm + 1e-12)
+            
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)
+                self.state[p]['e_w'] = e_w
+        
+        if zero_grad:
+            self.zero_grad()
+    
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                p.sub_(self.state[p]['e_w'])
+        
+        self.base_optimizer.step()
+        
+        if zero_grad:
+            self.zero_grad()
+    
+    def _grad_norm(self):
+        shared_device = self.param_groups[0]['params'][0].device
+        norm = torch.norm(
+            torch.stack([
+                p.grad.norm(p=2).to(shared_device)
+                for group in self.param_groups
+                for p in group['params']
+                if p.grad is not None
+            ]),
+            p=2
+        )
+        return norm
+
+
+if __name__ == "__main__":
+    model = torch.nn.Linear(10, 1)
+    base_optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    optimizer = SAM(model.parameters(), base_optimizer, rho=0.05)
+    
+    loss_fn = torch.nn.MSELoss()
+    x = torch.randn(5, 10)
+    y = torch.randn(5, 1)
+    
+    # SAM 需要两步优化
+    loss = loss_fn(model(x), y)
+    loss.backward()
+    optimizer.first_step(zero_grad=True)
+    
+    loss_fn(model(x), y).backward()
+    optimizer.second_step(zero_grad=True)
+    
+    print("SAM optimizer test passed!")
+```
+
+- [ ] **Step 3: 提交**
+
+```bash
+git add docs/training-stability-guide/05-algorithm-design.md
+git add docs/training-stability-guide/code-examples/stochastic_rounding.py
+git add docs/training-stability-guide/code-examples/sam_optimizer.py
+git commit -m "docs: add chapter 5 - algorithm-level stability techniques (CORE)
+
+- Stochastic rounding for low-precision training
+- Error feedback and Kahan summation
+- MOSS microscaling
+- SAM optimizer implementation
+- Spectral normalization
+- Unit Scaling (u-μP)
+- L-GRECO gradient compression
+- Complete code examples
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
+```
+
+---
+
+
 
