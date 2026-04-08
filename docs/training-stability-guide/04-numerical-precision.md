@@ -156,15 +156,70 @@ class FP8Scaler:
 
 ### 4.5.1 MXFP8 格式
 
-**机构**: [Rouhani et al. 2023] — Microsoft Research  
+MXFP8（Microscaling FP8）是一种细粒度量化格式，通过为张量的子块共享指数来提供比 per-tensor 更精细的控制：
+
+**核心特点**：
+- 128×128 块共享一个指数（块级缩放）
+- 块内使用 E4M3 格式存储数值
+- 全局缩放因子 + 局部块指数两级缩放
+
+**优势**：
+- 比 per-tensor 缩放更精细，减少量化误差
+- 比 per-element 缩放更高效，减少存储开销
+- 硬件友好，适合 Tensor Core 加速
+
+**信源**: [Rouhani et al. 2023] — Microsoft Research  
 **信源**: [Microscaling Formats for Deep Learning](https://arxiv.org/abs/2310.10537)
 
 ### 4.5.2 DeepSeek-V3 细粒度量化实践
+
+DeepSeek-V3 采用了细粒度的 FP8 量化策略：
+
+**激活量化**（1×128 tile-wise）：
+- 每个 token 的隐藏维度分成 128 元素的 tile
+- 每个 tile 独立计算缩放因子
+- 更好地处理激活中的离群值
+
+**权重量化**（128×128 block-wise）：
+- 权重矩阵分成 128×128 的块
+- 每个块独立量化
+- 保持权重的局部结构信息
+
+**在线计算缩放**：
+- 不依赖历史统计，实时计算每个块的最大值
+- 避免离群值导致的缩放不当
+
+```python
+class DeepSeekFP8Linear(nn.Module):
+    """DeepSeek-V3 风格的 FP8 线性层"""
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(out_features, in_features, dtype=torch.float8_e4m3fn))
+        self.weight_scale = nn.Parameter(torch.ones(out_features // 128, in_features // 128))
+    
+    def forward(self, x):
+        x_fp8, x_scale = self.quantize_activation(x)
+        output = torch._scaled_mm(x_fp8, self.weight.t(), scale_a=x_scale, scale_b=self.weight_scale)
+        return output
+    
+    def quantize_activation(self, x, tile_size=128):
+        x_reshaped = x.reshape(-1, x.size(-1) // tile_size, tile_size)
+        scale = x_reshaped.abs().max(dim=-1, keepdim=True)[0] / 448.0
+        x_quantized = (x_reshaped / scale).to(torch.float8_e4m3fn)
+        return x_quantized.reshape_as(x), scale
+```
 
 **机构**: DeepSeek (幻方量化)  
 **信源**: [DeepSeek-V3 Technical Report](https://arxiv.org/html/2412.19437v1#S5)
 
 ## 4.6 量化感知训练（QAT）稳定性
+
+量化感知训练通过在训练时模拟量化效果，使模型适应低精度推理：
+
+**伪量化（Fake Quantization）**：
+- 前向传播时模拟量化/反量化过程
+- 反向传播使用直通估计器（Straight-Through Estimator, STE）
+- 让模型学习适应量化误差
 
 ```python
 class FakeQuantize(nn.Module):
@@ -175,12 +230,24 @@ class FakeQuantize(nn.Module):
     
     def forward(self, x):
         if self.training:
+            # 量化
             x_quant = torch.round(x / self.scale)
             x_quant = torch.clamp(x_quant, -128, 127)
+            # 反量化
             x_dequant = x_quant * self.scale
+            # STE: 前向用反量化值，反向传原始梯度
             return x_dequant + (x - x_dequant).detach()
         return x
 ```
+
+**数值稳定性要点**：
+- 缩放因子需要足够大以覆盖张量范围，但不能过大导致精度损失
+- 训练初期使用较大的 batch size 稳定统计量
+- 逐步降低精度（FP32 → FP16 → INT8）进行渐进式量化
+
+**与低精度训练的区别**：
+- QAT 主要用于推理优化，训练时仍使用较高精度
+- FP8/BF16 训练是真正的低精度训练，需要处理数值稳定性问题
 
 ## 4.7 本章小结
 
@@ -189,6 +256,8 @@ class FakeQuantize(nn.Module):
 | 格式选择 | BF16 为现代硬件默认；FP8 用于极致性能 |
 | 混合精度 | 使用 GradScaler 防止梯度下溢 |
 | FP8 训练 | E4M3 用于前向，E5M2 用于反向 |
+| 微缩放 | MXFP8 提供细粒度量化，减少精度损失 |
+| QAT | 伪量化模拟推理精度，STE 实现梯度传播 |
 
 ---
 
